@@ -65,10 +65,6 @@ preferred could split them into two cross-linked standalone RFCs without
 changing their substance; they are kept together here because they are easier to
 evaluate as two halves of the same problem.
 
-### AI assistance
-
-AI was used to make holistic design decisions.
-
 ## Motivation
 
 ### Ordered observers
@@ -156,10 +152,12 @@ This RFC aims to provide:
    Observers for the same event can be ordered using the same vocabulary as
    systems.
 
-2. Cross-bucket observer ordering.
+2. Ordering across observer kinds.
 
-   A global observer can be ordered relative to an entity observer or component
-   observer for the same event.
+   Bevy dispatches observers through separate internal paths depending on how
+   each is attached — global, entity-targeted, or component-targeted. This RFC
+   lets a global observer be ordered relative to an entity observer or component
+   observer for the same event, across those paths.
 
 3. Stable behavior when no explicit observer ordering is supplied.
 
@@ -189,7 +187,9 @@ This RFC aims to provide:
 
 7. A narrow engine surface that libraries can build on.
 
-   Bevy provides ordering and access control. Library policy remains downstream.
+   Bevy provides the two mechanisms — observer ordering and the restricted write
+   gate — and nothing else. The behavior built on top (what to log, what to
+   replicate, when to snapshot, how to undo) stays in downstream crates.
 
 ### Scope (out of scope)
 
@@ -203,7 +203,6 @@ This RFC does not propose:
 - deterministic replay
 - audit policy
 - rollback netcode
-- a schedule-level write barrier
 - cross-schedule mutation windows
 - cross-app or sub-app mutation synchronization
 - parallel observer execution
@@ -212,9 +211,10 @@ This RFC does not propose:
 - a capability system that prevents malicious code from mutating state
 - a lint that detects every possible semantic mutation
 
-The restricted-access primitive is a safe API discipline tool, not a security
-boundary. [Unsafe world access][unsafe-world-cell] remains an escape hatch, as it does for many other
-ECS invariants.
+The restricted-access primitive is a safe-API discipline tool, not a security
+boundary. It stops _accidental_ mutation through ordinary safe in-place access;
+it does not claim to stop a determined author who controls the component's own
+crate, and it is not a hook that intercepts or records each mutation.
 
 ## User-facing explanation
 
@@ -955,8 +955,6 @@ they already reject immutable components. A dedicated restricted reflection API 
 be added later if reflection-driven tooling has a clear use case; see
 [Reflection and scenes](#reflection-and-scenes) for the scene-loading implication.
 
-[Unsafe APIs][unsafe-world-cell] remain unsafe escape hatches.
-
 #### Access registration
 
 `RestrictedMut<T>` must register a write access to `T`.
@@ -1249,7 +1247,8 @@ The restricted-access implementation should include coverage for:
   `EntityMutExcept::get_mut_by_id`, reject restricted components.
 - `ReflectComponent::reflect_mut`, `apply`, `apply_or_insert_mapped`, and
   `reflect_unchecked_mut` reject restricted components.
-- unsafe assume-mutable APIs remain unsafe escape hatches.
+- unsafe assume-mutable APIs are not a sanctioned bypass: using them to mutate a
+  restricted component as if it were ordinarily mutable is unsupported.
 - immutable and restricted markers cannot be combined.
 - relationship components cannot accidentally derive restricted mutable access if
   their mutability model forbids it.
@@ -1394,28 +1393,42 @@ describe relationships, not incidental insertion order.
 
 ### Component hooks only
 
-Component hooks observe structural changes, but they do not cover every in-place
-mutation through safe mutable ECS access.
+Component hooks fire on structural lifecycle changes (insert, discard, remove),
+not on in-place field mutation through safe mutable access, so hooks alone cannot
+react to an ordinary `Query<&mut T>` edit.
 
-Hooks and restricted access solve different halves of the problem:
+Restricted access does not add mutation _observation_ either: it does not hand the
+component author a per-mutation hook. Its effect is narrower — it removes the
+ordinary `&mut T` path so the only safe in-place mutation is through
+`RestrictedMut<T>`, a single named API a downstream crate can wrap. Hooks and
+restricted access are complementary but limited:
 
-```text
-hooks: observe structural lifecycle changes
-restricted access: prevent accidental direct in-place mutation
-```
+- hooks observe structural lifecycle changes;
+- restricted access steers in-place mutation onto a single named API.
 
-### Broad schedule-level write barriers
+### Immutable components
 
-A previous RFC explored a broader schedule-level write barrier
-([bevyengine/rfcs#86][rfc-86]). That design tries to say "no
-system writes T in this schedule window."
+[`#[component(immutable)]`][component-mutability] already removes the `&mut T`
+path entirely. A "mutation" of an immutable component is a structural reinsert of
+a freshly constructed value, which fires the existing component lifecycle hooks —
+real, enforced, observable change today, without either primitive in this RFC.
 
-This RFC intentionally does not propose that.
+Immutable components are the right tool whenever every edit can afford to build
+and insert a whole new component value. Restricted access targets the case they
+do not serve well:
 
-Schedule-level barriers may still be useful, but they are larger and harder to
-specify. They raise questions about commands, delayed commands, cross-schedule
-windows, diagnostics, and schedule graph analysis. The two primitives in this RFC
-are smaller and independently useful.
+- **In-place efficiency.** Reinsert requires owning a complete `T` for every
+  edit. That is wasteful when only one field changes, and impossible when `T`
+  holds data that is large or cannot be cloned. `RestrictedMut<T>` mutates in
+  place with no reconstruction.
+- **No structural churn.** Reinsert is a remove-and-insert: it can move the
+  entity between archetypes and fires lifecycle hooks rather than an in-place
+  "changed" signal. `RestrictedMut<T>` leaves the component in place and updates
+  change-detection ticks like an ordinary `&mut`.
+
+The trade-off is explicit: immutable components give the stronger guarantee (no
+in-place mutation is even expressible), while restricted access trades some of
+that strength for in-place efficiency on components that are costly to rebuild.
 
 ### Engine-owned mutation logs
 
@@ -1590,7 +1603,6 @@ would support them:
 - richer observer cycle diagnostics
 - dynamic restricted-mutation APIs
 - field-level restricted access
-- schedule-level write barriers
 - command write manifests
 - downstream mutation logs
 - downstream save/load frameworks
@@ -1638,7 +1650,6 @@ save/load, replay, undo, or audit design.
 [world-reflect]: https://docs.rs/bevy_ecs/latest/bevy_ecs/world/struct.World.html#method.get_reflect_mut
 [bevy-pr-24328]: https://github.com/bevyengine/bevy/pull/24328
 [bevy-pr-24370]: https://github.com/bevyengine/bevy/pull/24370
-[rfc-86]: https://github.com/bevyengine/rfcs/pull/86
 [bevy-ai-policy]: https://bevy.org/learn/contribute/policies/ai/
 [bevy-replicon]: https://docs.rs/bevy_replicon/latest/bevy_replicon/
 [lightyear]: https://docs.rs/lightyear/latest/lightyear/
